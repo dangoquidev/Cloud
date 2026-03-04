@@ -1,0 +1,12 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "pixel-canvas"
+resolve_s3 = true
+s3_prefix = "pixel-canvas"
+region = "eu-west-1"
+capabilities = "CAPABILITY_IAM"
+image_repositories = []
+
+[default.global.parameters]
+region = "eu-west-1"
