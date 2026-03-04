@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: Pixel Canvas - Serverless Discord Bot & Web App
+
+Globals:
+  Function:
+    Timeout: 10
+    Runtime: python3.11
+    Environment:
+      Variables:
+        SQS_QUEUE_URL: !Ref PixelEventsQueue
+        REGION: eu-west-1
+  HttpApi:
+    CorsConfiguration:
+      AllowMethods:
+        - GET
+        - POST
+        - OPTIONS
+      AllowHeaders:
+        - Content-Type
+        - Authorization
+      AllowOrigins:
+        - "*"
+
+Resources:
+
+  # ─── SQS FIFO Queue ───────────────────────────────────────────
+  PixelEventsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: pixel-events-sam.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 120
+
+  SnapshotEventsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: snapshot-events-sam.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 180
+
+  # ─── Discord Proxy Function ───────────────────────────────────
+  DiscordProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: discord-proxy-fn
+      CodeUri: functions/discord-proxy/
+      Handler: app.lambda_handler
+      Description: "Validates Discord signature, ACKs interactions, publishes to SQS"
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PixelEventsQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:eu-west-1:${AWS::AccountId}:secret:discord/public-key*"
+      Events:
+        DiscordInteractions:
+          Type: HttpApi
+          Properties:
+            Path: /discord/interactions
+            Method: POST
+  # ─── Pixel Worker Function ────────────────────────────────────
+  PixelWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: pixel-worker-fn
+      CodeUri: functions/pixel-worker/
+      Handler: app.lambda_handler
+      Timeout: 30
+      Description: "Consumes SQS, validates rate limit, writes pixel to DynamoDB"
+      Environment:
+        Variables:
+          SNAPSHOT_QUEUE_URL: !Ref SnapshotEventsQueue
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt PixelEventsQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SnapshotEventsQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: canvas-pixels
+        - DynamoDBCrudPolicy:
+            TableName: rate-limits
+        - DynamoDBCrudPolicy:
+            TableName: sessions
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:eu-west-1:${AWS::AccountId}:secret:discord/bot-token*"
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PixelEventsQueue.Arn
+            BatchSize: 1
+  # ─── Canvas Reader Function ───────────────────────────────────
+  CanvasReaderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: canvas-reader-fn
+      CodeUri: functions/canvas-reader/
+      Handler: app.lambda_handler
+      Description: "Returns current canvas state as JSON"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: canvas-pixels
+      Events:
+        GetCanvas:
+          Type: HttpApi
+          Properties:
+            Path: /canvas
+            Method: GET
+
+  # ─── Snapshot Worker Function ─────────────────────────────────
+  SnapshotWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: snapshot-worker-fn
+      CodeUri: functions/snapshot-worker/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Description: "Generates PNG snapshot and uploads to S3"
+      Environment:
+        Variables:
+          SNAPSHOT_BUCKET: pixel-canvas-snapshots-dango
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt SnapshotEventsQueue.QueueName
+        - DynamoDBReadPolicy:
+            TableName: canvas-pixels
+        - S3WritePolicy:
+            BucketName: pixel-canvas-snapshots-dango
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:eu-west-1:${AWS::AccountId}:secret:discord/bot-token*"
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SnapshotEventsQueue.Arn
+            BatchSize: 1
+  # ─── Auth Function ────────────────────────────────────────────
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: auth-fn
+      CodeUri: functions/auth/
+      Handler: app.lambda_handler
+      Description: "Handles Discord OAuth2 and JWT generation"
+      Environment:
+        Variables:
+          DISCORD_APP_ID: "1479139018116563127"
+          REDIRECT_URI: "https://hu0hglnwf8.execute-api.eu-west-1.amazonaws.com/auth/callback"
+          FRONTEND_URL: "http://pixel-canvas-snapshots-dango.s3-website-eu-west-1.amazonaws.com"
+          JWT_SECRET: "98dc2a509158cee5ecd48408513d3df7a4716d9af62094eebf09de6aff41f354"
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:eu-west-1:${AWS::AccountId}:secret:discord/client-secret*"
+      Events:
+        AuthLogin:
+          Type: HttpApi
+          Properties:
+            Path: /auth/login
+            Method: GET
+        AuthCallback:
+          Type: HttpApi
+          Properties:
+            Path: /auth/callback
+            Method: GET
+        AuthMe:
+          Type: HttpApi
+          Properties:
+            Path: /auth/me
+            Method: GET
+
+  # ─── Web Proxy Function (pixels depuis le web) ────────────────
+  WebProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: web-proxy-fn
+      CodeUri: functions/web-proxy/
+      Handler: app.lambda_handler
+      Description: "Receives authenticated web pixel requests, publishes to SQS"
+      Environment:
+        Variables:
+          JWT_SECRET: "98dc2a509158cee5ecd48408513d3df7a4716d9af62094eebf09de6aff41f354"
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PixelEventsQueue.QueueName
+      Events:
+        PostPixel:
+          Type: HttpApi
+          Properties:
+            Path: /pixels
+            Method: POST
+        OptionsPixel:
+          Type: HttpApi
+          Properties:
+            Path: /pixels
+            Method: OPTIONS
+
+Outputs:
+  DiscordInteractionsUrl:
+    Description: "URL a coller dans le Discord Developer Portal"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.eu-west-1.amazonaws.com/discord/interactions"
+  CanvasApiUrl:
+    Description: "URL pour lire le canvas"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.eu-west-1.amazonaws.com/canvas"
