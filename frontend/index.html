@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pixel Canvas</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; color: #fff; font-family: Arial, sans-serif; }
+    header { background: #16213e; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
+    header h1 { font-size: 1.4rem; }
+    #user-info { display: flex; align-items: center; gap: 10px; }
+    #login-btn { background: #5865f2; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+    #canvas-container { display: flex; justify-content: center; align-items: flex-start; padding: 20px; gap: 20px; flex-wrap: wrap; }
+    #canvas { border: 2px solid #333; cursor: crosshair; image-rendering: pixelated; }
+    #sidebar { background: #16213e; border-radius: 8px; padding: 16px; min-width: 200px; }
+    #sidebar h2 { margin-bottom: 12px; font-size: 1rem; }
+    .info-row { margin: 8px 0; font-size: 0.85rem; color: #aaa; }
+    .info-row span { color: #fff; }
+    #color-picker { width: 100%; height: 40px; border: none; border-radius: 6px; cursor: pointer; margin: 10px 0; }
+    #draw-btn { width: 100%; background: #5865f2; color: white; border: none; padding: 10px; border-radius: 6px; cursor: pointer; font-size: 0.95rem; }
+    #draw-btn:disabled { background: #444; cursor: not-allowed; }
+    #status { margin-top: 10px; font-size: 0.8rem; color: #aaa; text-align: center; }
+    #pixel-info { margin-top: 16px; padding-top: 16px; border-top: 1px solid #333; font-size: 0.8rem; }
+    #pixel-info h3 { margin-bottom: 8px; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🎨 Pixel Canvas</h1>
+  <div id="user-info">
+    <span id="username-display">Non connecté</span>
+    <button id="login-btn" onclick="login()">Se connecter avec Discord</button>
+  </div>
+</header>
+
+<div id="canvas-container">
+  <canvas id="canvas" width="600" height="600"></canvas>
+
+  <div id="sidebar">
+    <h2>🖌️ Dessiner</h2>
+    <div class="info-row">Position : <span id="pos-display">-</span></div>
+    <div class="info-row">Couleur :</div>
+    <input type="color" id="color-picker" value="#FF0000">
+    <button id="draw-btn" onclick="drawPixel()" disabled>Sélectionne un pixel</button>
+    <div id="status"></div>
+
+    <div id="pixel-info" style="display:none">
+      <h3>📍 Pixel info</h3>
+      <div class="info-row">Auteur : <span id="pixel-author">-</span></div>
+      <div class="info-row">Modifié : <span id="pixel-date">-</span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ─── Config ───────────────────────────────────────────────────
+  const API_URL = "https://hu0hglnwf8.execute-api.eu-west-1.amazonaws.com";
+  const PIXEL_SIZE = 10;
+  const CANVAS_W   = 600;
+  const CANVAS_H   = 600;
+
+  // ─── State ────────────────────────────────────────────────────
+  let token       = null;
+  let selectedX   = null;
+  let selectedY   = null;
+  let pixelsMap   = {};  // "x,y" → pixel data
+
+  const canvas  = document.getElementById("canvas");
+  const ctx     = canvas.getContext("2d");
+
+  // ─── Auth ─────────────────────────────────────────────────────
+  function login() {
+    window.location.href = API_URL + "/auth/login";
+  }
+
+  function checkAuth() {
+  // Récupère le token depuis le HASH (après #)
+  const hash = window.location.hash;
+  if (hash.startsWith("#token=")) {
+    token = hash.substring(7);
+    localStorage.setItem("jwt", token);
+    window.history.replaceState({}, "", "/");
+  } else {
+    token = localStorage.getItem("jwt");
+  }
+
+  if (token) {
+    fetch(API_URL + "/auth/me", {
+      headers: { "Authorization": "Bearer " + token }
+    })
+    .then(r => r.json())
+    .then(user => {
+      document.getElementById("username-display").textContent = "👤 " + user.username;
+      document.getElementById("login-btn").style.display = "none";
+    })
+    .catch(() => {
+      token = null;
+      localStorage.removeItem("jwt");
+    });
+  }
+}
+
+  // ─── Canvas ───────────────────────────────────────────────────
+  function drawBackground() {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    // Grille légère
+    ctx.strokeStyle = "#eeeeee";
+    ctx.lineWidth = 0.5;
+    for (let x = 0; x < CANVAS_W; x += PIXEL_SIZE) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, CANVAS_H); ctx.stroke();
+    }
+    for (let y = 0; y < CANVAS_H; y += PIXEL_SIZE) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(CANVAS_W, y); ctx.stroke();
+    }
+  }
+
+  function renderPixels() {
+    drawBackground();
+    Object.values(pixelsMap).forEach(p => {
+      const cx = (p.x % (CANVAS_W / PIXEL_SIZE)) * PIXEL_SIZE;
+      const cy = (p.y % (CANVAS_H / PIXEL_SIZE)) * PIXEL_SIZE;
+      ctx.fillStyle = p.color;
+      ctx.fillRect(cx, cy, PIXEL_SIZE, PIXEL_SIZE);
+    });
+
+    // Highlight pixel sélectionné
+    if (selectedX !== null) {
+      const cx = (selectedX % (CANVAS_W / PIXEL_SIZE)) * PIXEL_SIZE;
+      const cy = (selectedY % (CANVAS_H / PIXEL_SIZE)) * PIXEL_SIZE;
+      ctx.strokeStyle = "#000000";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(cx, cy, PIXEL_SIZE, PIXEL_SIZE);
+    }
+  }
+
+  function loadCanvas() {
+    fetch(API_URL + "/canvas")
+      .then(r => r.json())
+      .then(data => {
+        pixelsMap = {};
+        data.pixels.forEach(p => { pixelsMap[p.x + "," + p.y] = p; });
+        renderPixels();
+      })
+      .catch(e => console.error("Canvas load error:", e));
+  }
+
+  // ─── Interactions ─────────────────────────────────────────────
+  canvas.addEventListener("click", function(e) {
+    const rect = canvas.getBoundingClientRect();
+    const mx   = e.clientX - rect.left;
+    const my   = e.clientY - rect.top;
+    selectedX   = Math.floor(mx / PIXEL_SIZE);
+    selectedY   = Math.floor(my / PIXEL_SIZE);
+
+    document.getElementById("pos-display").textContent = `(${selectedX}, ${selectedY})`;
+
+    const key   = selectedX + "," + selectedY;
+    const pixel = pixelsMap[key];
+    const info  = document.getElementById("pixel-info");
+    if (pixel) {
+      info.style.display = "block";
+      document.getElementById("pixel-author").textContent = pixel.author_name || pixel.author_id || "Inconnu";
+      const date = new Date(parseInt(pixel.updated_at) * 1000);
+      document.getElementById("pixel-date").textContent = date.toLocaleString();
+    } else {
+      info.style.display = "none";
+    }
+
+    const btn = document.getElementById("draw-btn");
+    btn.textContent = `Dessiner en (${selectedX}, ${selectedY})`;
+    btn.disabled = !token;
+
+    renderPixels();
+  });
+
+  canvas.addEventListener("mousemove", function(e) {
+    const rect = canvas.getBoundingClientRect();
+    const mx   = Math.floor((e.clientX - rect.left) / PIXEL_SIZE);
+    const my   = Math.floor((e.clientY - rect.top)  / PIXEL_SIZE);
+    document.getElementById("pos-display").textContent = `(${mx}, ${my})`;
+  });
+
+  function drawPixel() {
+    if (!token || selectedX === null) return;
+    const color   = document.getElementById("color-picker").value.replace("#", "");
+    const status  = document.getElementById("status");
+    const btn     = document.getElementById("draw-btn");
+
+    btn.disabled  = true;
+    status.textContent = "⏳ Envoi...";
+
+    fetch(API_URL + "/pixels", {
+      method:  "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": "Bearer " + token
+      },
+      body: JSON.stringify({ x: selectedX, y: selectedY, color: color })
+    })
+    .then(r => r.json())
+    .then(data => {
+      status.textContent = "✅ Pixel envoyé !";
+      setTimeout(() => loadCanvas(), 1500);
+      setTimeout(() => { status.textContent = ""; btn.disabled = false; }, 2000);
+    })
+    .catch(e => {
+      status.textContent = "❌ Erreur";
+      btn.disabled = false;
+    });
+  }
+
+  // ─── Init ─────────────────────────────────────────────────────
+  checkAuth();
+  drawBackground();
+  loadCanvas();
+
+  // Poll toutes les 5 secondes
+  setInterval(loadCanvas, 5000);
+</script>
+</body>
+</html>
